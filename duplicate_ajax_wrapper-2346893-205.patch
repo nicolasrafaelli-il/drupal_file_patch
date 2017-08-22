@@ -1,0 +1,372 @@
+diff --git a/web/core/lib/Drupal/Core/Render/Renderer.php b/web/core/lib/Drupal/Core/Render/Renderer.php
+index 287ffbb1e9..c39eb4db78 100644
+--- a/web/core/lib/Drupal/Core/Render/Renderer.php
++++ b/web/core/lib/Drupal/Core/Render/Renderer.php
+@@ -236,6 +236,36 @@ protected function doRender(&$elements, $is_root_call = FALSE) {
+       return '';
+     }
+
++    // Render only the children if the internal #render_children property is
++    // set.
++    // @see \Drupal\Core\Theme\ThemeManager::render().
++    if (isset($elements['#render_children'])) {
++      // A non-empty #children property takes precedence. This happens only if
++      // it has been manually set into the render array.
++      if (!empty($elements['#children'])) {
++        $children_keys = ['#children'];
++      }
++      else {
++        $children_keys = Element::children($elements);
++
++        if (empty($children_keys)) {
++          return '';
++        }
++      }
++
++      // Remove all elements except the children because the main level has been
++      // already rendered when the #render_children is set and therefore they
++      // should not have any effect on the render children.
++      $new_elements = array_intersect_key($elements, array_flip($children_keys));
++      // Create a new variable that references the render array that was passed
++      // in. This allows the markup and cache information to be attached after
++      // rendering the new elements array.
++      $original_elements = &$elements;
++      // Change $elements to reference $new_elements. This prevents
++      // unintentional changes to the render array that was passed in.
++      $elements = &$new_elements;
++    }
++
+     $context = $this->getCurrentRenderContext();
+     if (!isset($context)) {
+       throw new \LogicException("Render context is empty, because render() was called outside of a renderRoot() or renderPlain() call. Use renderPlain()/renderRoot() or #lazy_builder/#pre_render instead.");
+@@ -428,10 +458,8 @@ protected function doRender(&$elements, $is_root_call = FALSE) {
+     }
+
+     // Call the element's #theme function if it is set. Then any children of the
+-    // element have to be rendered there. If the internal #render_children
+-    // property is set, do not call the #theme function to prevent infinite
+-    // recursion.
+-    if ($theme_is_implemented && !isset($elements['#render_children'])) {
++    // element have to be rendered there.
++    if ($theme_is_implemented) {
+       $elements['#children'] = $this->theme->render($elements['#theme'], $elements);
+
+       // If ThemeManagerInterface::render() returns FALSE this means that the
+@@ -440,10 +468,10 @@ protected function doRender(&$elements, $is_root_call = FALSE) {
+       $theme_is_implemented = ($elements['#children'] !== FALSE);
+     }
+
+-    // If #theme is not implemented or #render_children is set and the element
+-    // has an empty #children attribute, render the children now. This is the
+-    // same process as Renderer::render() but is inlined for speed.
+-    if ((!$theme_is_implemented || isset($elements['#render_children'])) && empty($elements['#children'])) {
++    // If #theme is not implemented and the element has an empty #children
++    // attribute, render the children now. This is the same process as
++    // Renderer::render() but is inlined for speed.
++    if (!$theme_is_implemented && empty($elements['#children'])) {
+       foreach ($children as $key) {
+         $elements['#children'] .= $this->doRender($elements[$key]);
+       }
+@@ -467,9 +495,7 @@ protected function doRender(&$elements, $is_root_call = FALSE) {
+     // because the #type 'page' render array from drupal_prepare_page() would
+     // render the $page and wrap it into the html.html.twig template without the
+     // attached assets otherwise.
+-    // If the internal #render_children property is set, do not call the
+-    // #theme_wrappers function(s) to prevent infinite recursion.
+-    if (isset($elements['#theme_wrappers']) && !isset($elements['#render_children'])) {
++    if (isset($elements['#theme_wrappers'])) {
+       foreach ($elements['#theme_wrappers'] as $key => $value) {
+         // If the value of a #theme_wrappers item is an array then the theme
+         // hook is found in the key of the item and the value contains attribute
+@@ -552,6 +578,17 @@ protected function doRender(&$elements, $is_root_call = FALSE) {
+     $context->bubble();
+
+     $elements['#printed'] = TRUE;
++
++    // #markup should be always saved to the referenced elements variable to
++    // prevent re-rendering. #cache and #attached ensures that correct cacheable
++    // metadata is applied for the re-rendered instances.
++    if (isset($original_elements)) {
++      $original_elements['#markup'] = $elements['#markup'];
++      $original_elements['#cache'] = $elements['#cache'];
++      $original_elements['#attached'] = $elements['#attached'];
++      $original_elements['#printed'] = $elements['#printed'];
++    }
++
+     return $elements['#markup'];
+   }
+
+diff --git a/web/core/modules/file/src/Tests/FileFieldValidateTest.php b/web/core/modules/file/src/Tests/FileFieldValidateTest.php
+index 5ddcdde3f8..599300b909 100644
+--- a/web/core/modules/file/src/Tests/FileFieldValidateTest.php
++++ b/web/core/modules/file/src/Tests/FileFieldValidateTest.php
+@@ -185,4 +185,25 @@ public function testFileRemoval() {
+     $this->assertText('Article ' . $node->getTitle() . ' has been updated.');
+   }
+
++  /**
++   * Test the validation message is displayed only once for ajax uploads.
++   */
++  public function testAJAXValidationMessage() {
++    $field_name = strtolower($this->randomMachineName());
++    $this->createFileField($field_name, 'node', 'article');
++
++    $this->drupalGet('node/add/article');
++    /** @var \Drupal\file\FileInterface $image_file */
++    $image_file = $this->getTestFile('image');
++    $edit = [
++      'files[' . $field_name . '_0]' => $this->container->get('file_system')->realpath($image_file->getFileUri()),
++      'title[0][value]' => $this->randomMachineName(),
++    ];
++    $this->drupalPostAjaxForm(NULL, $edit, $field_name . '_0_upload_button');
++    $elements = $this->xpath('//div[contains(@class, :class)]', [
++      ':class' => 'messages--error',
++    ]);
++    $this->assertEqual(count($elements), 1, 'Ajax validation messages are displayed once.');
++  }
++
+ }
+diff --git a/web/core/modules/image/src/Tests/ImageFieldValidateTest.php b/web/core/modules/image/src/Tests/ImageFieldValidateTest.php
+index 7e5ee9bae7..be6077a3d8 100644
+--- a/web/core/modules/image/src/Tests/ImageFieldValidateTest.php
++++ b/web/core/modules/image/src/Tests/ImageFieldValidateTest.php
+@@ -156,4 +156,26 @@ protected function getFieldSettings($min_resolution, $max_resolution) {
+     ];
+   }
+
++  /**
++   * Test the validation message is displayed only once for ajax uploads.
++   */
++  public function testAJAXValidationMessage() {
++    $field_name = strtolower($this->randomMachineName());
++    $this->createImageField($field_name, 'article', ['cardinality' => -1]);
++
++    $this->drupalGet('node/add/article');
++    /** @var \Drupal\file\FileInterface[] $text_files */
++    $text_files = $this->drupalGetTestFiles('text');
++    $text_file = reset($text_files);
++    $edit = [
++      'files[' . $field_name . '_0][]' => $this->container->get('file_system')->realpath($text_file->uri),
++      'title[0][value]' => $this->randomMachineName(),
++    ];
++    $this->drupalPostAjaxForm(NULL, $edit, $field_name . '_0_upload_button');
++    $elements = $this->xpath('//div[contains(@class, :class)]', [
++      ':class' => 'messages--error',
++    ]);
++    $this->assertEqual(count($elements), 1, 'Ajax validation messages are displayed once.');
++  }
++
+ }
+diff --git a/web/core/tests/Drupal/KernelTests/Core/Render/RenderTest.php b/web/core/tests/Drupal/KernelTests/Core/Render/RenderTest.php
+index a64b553a16..447f33698b 100644
+--- a/web/core/tests/Drupal/KernelTests/Core/Render/RenderTest.php
++++ b/web/core/tests/Drupal/KernelTests/Core/Render/RenderTest.php
+@@ -2,6 +2,7 @@
+
+ namespace Drupal\KernelTests\Core\Render;
+
++use Drupal\Core\Cache\Cache;
+ use Drupal\KernelTests\KernelTestBase;
+
+ /**
+@@ -16,7 +17,7 @@ class RenderTest extends KernelTestBase {
+    *
+    * @var array
+    */
+-  public static $modules = ['system', 'common_test'];
++  public static $modules = ['system', 'common_test', 'theme_test'];
+
+   /**
+    * Tests theme preprocess functions being able to attach assets.
+@@ -44,6 +45,23 @@ public function testDrupalRenderThemePreprocessAttached() {
+   }
+
+   /**
++   * Ensures that render array children are processed correctly.
++   */
++  public function testRenderChildren() {
++    // Ensure that #prefix and #suffix is only being printed once since that is
++    // the behaviour the caller code expects.
++    $build = [
++      '#type' => 'container',
++      '#theme' => 'theme_test_render_element_children',
++      '#prefix' => 'kangaroo',
++      '#suffix' => 'kitten',
++    ];
++    $this->render($build);
++    $this->removeWhiteSpace();
++    $this->assertNoRaw('<div>kangarookitten</div>');
++  }
++
++  /**
+    * Tests that we get an exception when we try to attach an illegal type.
+    */
+   public function testProcessAttached() {
+diff --git a/web/core/tests/Drupal/Tests/Core/Render/RendererBubblingTest.php b/web/core/tests/Drupal/Tests/Core/Render/RendererBubblingTest.php
+index 3e1ee407ec..ada9db8efc 100644
+--- a/web/core/tests/Drupal/Tests/Core/Render/RendererBubblingTest.php
++++ b/web/core/tests/Drupal/Tests/Core/Render/RendererBubblingTest.php
+@@ -291,6 +291,42 @@ public function providerTestContextBubblingEdgeCases() {
+     ];
+     $data[] = [$test_element, ['bar', 'foo'], $expected_cache_items];
+
++    // Ensure that bubbleable metadata has been collected from children and set
++    // correctly to the main level of the render array. That ensures that correct
++    // bubbleable metadata exists if render array gets rendered multiple times.
++    $test_element = [
++      '#cache' => [
++        'keys' => ['parent'],
++        'tags' => ['yar', 'har']
++      ],
++      '#markup' => 'parent',
++      'child' => [
++        '#render_children' => TRUE,
++        'subchild' => [
++          '#cache' => [
++            'contexts' => ['foo'],
++            'tags' => ['fiddle', 'dee'],
++          ],
++          '#attached' => [
++            'library' => ['foo/bar']
++          ],
++          '#markup' => '',
++        ]
++      ],
++    ];
++    $expected_cache_items = [
++      'parent:foo' => [
++        '#attached' => ['library' => ['foo/bar']],
++        '#cache' => [
++          'contexts' => ['foo'],
++          'tags' => ['dee', 'fiddle', 'har', 'yar'],
++          'max-age' => Cache::PERMANENT,
++        ],
++        '#markup' => 'parent',
++      ],
++    ];
++    $data[] = [$test_element, ['foo'], $expected_cache_items];
++
+     return $data;
+   }
+
+diff --git a/web/core/tests/Drupal/Tests/Core/Render/RendererTest.php b/web/core/tests/Drupal/Tests/Core/Render/RendererTest.php
+index 7ac4a90164..e5cf1b8b16 100644
+--- a/web/core/tests/Drupal/Tests/Core/Render/RendererTest.php
++++ b/web/core/tests/Drupal/Tests/Core/Render/RendererTest.php
+@@ -363,6 +363,25 @@ public function providerTestRenderBasic() {
+     };
+     $data[] = [$build, 'baz', $setup_code];
+
++    // #theme is implemented but #render_children is TRUE. In this case the
++    // calling code is expecting only the children to be rendered. #prefix and
++    // #suffix should not be inherited for the children.
++    $build = [
++      '#theme' => 'common_test_foo',
++      '#children' => '',
++      '#prefix' => 'kangaroo',
++      '#suffix' => 'unicorn',
++      '#render_children' => TRUE,
++      'child' => [
++        '#markup' => 'kitten',
++      ],
++    ];
++    $setup_code = function() {
++      $this->themeManager->expects($this->never())
++        ->method('render');
++    };
++    $data[] = [$build, 'kitten', $setup_code];
++
+     return $data;
+   }
+
+@@ -522,19 +541,21 @@ public function testRenderAccessCacheabilityDependencyInheritance() {
+   }
+
+   /**
+-   * Tests that a first render returns the rendered output and a second doesn't.
++   * Tests rendering same render array twice.
+    *
+-   * (Because of the #printed property.)
++   * Tests that a first render returns the rendered output and a second doesn't
++   * because of the #printed property. Also tests that correct metadata has been
++   * set for re-rendering.
+    *
+    * @covers ::render
+    * @covers ::doRender
++   *
++   * @dataProvider providerRenderTwice
+    */
+-  public function testRenderTwice() {
+-    $build = [
+-      '#markup' => 'test',
+-    ];
+-
+-    $this->assertEquals('test', $this->renderer->renderRoot($build));
++  public function testRenderTwice($build) {
++    $this->assertEquals('kittens', $this->renderer->renderRoot($build));
++    $this->assertEquals('kittens', $build['#markup']);
++    $this->assertEquals(['kittens-147'], $build['#cache']['tags']);
+     $this->assertTrue($build['#printed']);
+
+     // We don't want to reprint already printed render arrays.
+@@ -542,6 +563,60 @@ public function testRenderTwice() {
+   }
+
+   /**
++   * Provides a list of render array iterations.
++   *
++   * @return array
++   */
++  public function providerRenderTwice() {
++    return [
++      [
++        [
++          '#markup' => 'kittens',
++          '#cache' => [
++            'tags' => ['kittens-147']
++          ],
++        ],
++      ],
++      [
++        [
++          'child' => [
++            '#markup' => 'kittens',
++            '#cache' => [
++              'tags' => ['kittens-147'],
++            ],
++          ],
++        ],
++      ],
++      [
++        [
++          '#render_children' => TRUE,
++          'child' => [
++            '#markup' => 'kittens',
++            '#cache' => [
++              'tags' => ['kittens-147'],
++            ],
++          ],
++        ],
++      ],
++    ];
++  }
++
++  /**
++   * Ensures that #access is taken in account when rendering #render_children.
++   */
++  public function testRenderChildrenAccess() {
++    $build = [
++      '#access' => FALSE,
++      '#render_children' => TRUE,
++      'child' => [
++        '#markup' => 'kittens',
++      ],
++    ];
++
++    $this->assertEquals('', $this->renderer->renderRoot($build));
++  }
++
++  /**
+    * Provides a list of both booleans.
+    *
+    * @return array
